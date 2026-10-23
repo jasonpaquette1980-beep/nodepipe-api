@@ -1,0 +1,99 @@
+name: Daily refresh + rebuild + redeploy
+
+# What this does (Nodepipe):
+#   1. Pulls yesterday's Docker image from Docker Hub and extracts data.db
+#      (first run: builds data.db from Edmonton's public open data instead).
+#   2. Runs the freshness engine (refresh.py) -> new/closed/changed detection.
+#   3. Rebuilds the Docker image with the refreshed DB, pushes to Docker Hub.
+#   4. Triggers the Render deploy hook so the live API picks up the new image.
+# The database never lives in git (it's ~350MB); the registry is its home.
+
+on:
+  schedule:
+    # 05:38 America/Edmonton in standard time (UTC-7, Nov-Mar).
+    # During daylight time (UTC-6, Mar-Nov) this fires at 04:38 local.
+    - cron: '38 11 * * *'
+  workflow_dispatch:  # manual run from the Actions tab
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/nodepipe
+
+jobs:
+  refresh-build-push-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Restore previous data.db from the last image (if any)
+        id: restore
+        run: |
+          set +e
+          if docker pull "$IMAGE_NAME:latest" >/dev/null 2>&1; then
+            CID=$(docker create "$IMAGE_NAME:latest")
+            docker cp "$CID:/app/data.db" ./data.db
+            docker rm "$CID" >/dev/null
+            COUNT=$(python -c "import sqlite3; print(sqlite3.connect('data.db').execute('select count(*) from businesses').fetchone()[0])" 2>/dev/null || echo 0)
+            echo "restored $COUNT business rows from the previous image"
+            if [ "$COUNT" -gt 1000 ]; then
+              echo "have_db=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "have_db=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "no previous image found - this is the first run"
+            echo "have_db=false" >> "$GITHUB_OUTPUT"
+          fi
+          set -e
+
+      - name: First run - build the database from public sources
+        if: steps.restore.outputs.have_db != 'true'
+        run: |
+          python ingest.py
+          # refresh.py then day-zeroes the permits feed honestly
+          # (no fake "new" events) and starts the snapshot history.
+
+      - name: Run the daily freshness refresh
+        run: python refresh.py
+
+      - name: Checkpoint SQLite WAL into data.db
+        run: python -c "import sqlite3; c=sqlite3.connect('data.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close(); print('checkpointed')"
+
+      - name: Export the day's digest (feeds the New in Edmonton post)
+        run: python scripts/export_digest.py
+
+      - name: Build and push the image
+        run: |
+          TAG_DATE=$(date +%F)
+          docker build -t "$IMAGE_NAME:latest" -t "$IMAGE_NAME:$TAG_DATE" .
+          docker push "$IMAGE_NAME:$TAG_DATE"
+          docker push "$IMAGE_NAME:latest"
+
+      - name: Upload digest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-$(date +%F)
+          path: |
+            digest_*.md
+            permits_digest_*.md
+            permits_changes_*.csv
+          if-no-files-found: warn
+
+      - name: Trigger the Render redeploy
+        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
+        run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
