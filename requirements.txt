@@ -1,0 +1,4 @@
+fastapi==0.143.3
+uvicorn==0.54.0
+requests==2.34.2
+psycopg[binary]  # only needed when DATABASE_URL points at Postgres (see pg.py)
