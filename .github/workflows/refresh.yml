@@ -10,8 +10,8 @@ name: Daily refresh + rebuild + redeploy
 
 on:
   schedule:
-    # 05:38 America/Edmonton in standard time (UTC-7, Nov-Mar).
-    # During daylight time (UTC-6, Mar-Nov) this fires at 04:38 local.
+    # 05:38 America/Edmonton in daylight time (UTC-6, Mar-Nov).
+    # During standard time (UTC-7, Nov-Mar) this fires at 04:38 local.
     - cron: '38 11 * * *'
   workflow_dispatch:  # manual run from the Actions tab
 
@@ -95,5 +95,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Trigger the Render redeploy
-        if: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
-        run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+        run: |
+          if [ -n "${{ secrets.RENDER_DEPLOY_HOOK_URL }}" ]; then
+            curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+          else
+            echo "No Render deploy hook configured - skipping redeploy"
+          fi
